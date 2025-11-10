@@ -50,7 +50,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 // ==================== ROTAS PROTEGIDAS ====================
 
-// Criar cobrança PIX
+// Criar cobrança PIX (RECEBER)
 app.post('/api/create-pix', authenticateToken, async (req, res) => {
   try {
     const { valor, descricao, devedor } = req.body;
@@ -164,18 +164,26 @@ app.get('/api/check-pix/:txid', authenticateToken, async (req, res) => {
     console.log('Status verificado:', statusData);
 
     // Atualizar status no banco se foi pago
-    if (statusData.status === 'APROVADO') {
-        await pool.query(
-            'UPDATE transactions SET status = $1 WHERE transaction_id = $2',
+    if (statusData.status === 'APROVADO' || statusData.status === 'CONCLUIDA') {
+        console.log('💰 PIX foi pago! Atualizando status no banco...');
+
+        const updateResult = await pool.query(
+            'UPDATE transactions SET status = $1 WHERE transaction_id = $2 RETURNING *',
             ['completed', txid]
         );
+
+        if (updateResult.rowCount > 0) {
+            console.log('✅ Status atualizado no banco:', updateResult.rows[0]);
+        } else {
+            console.warn('⚠️ Nenhuma transação foi atualizada. TXID pode não existir:', txid);
+        }
     }
 
     res.json({
       success: true,
       data: {
         status: statusData.status,
-        isPaid: statusData.status === 'APROVADO',
+        isPaid: statusData.status === 'APROVADO' || statusData.status === 'CONCLUIDA',
         ...statusData,
       },
     });
@@ -202,7 +210,6 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
 
         console.log(`✅ Encontradas ${result.rows.length} transações`);
 
-        // ✅ CORRIGIDO: Retornar array direto (compatível com frontend)
         res.json(result.rows);
     } catch (error) {
         console.error('❌ Erro ao listar transações:', error);
@@ -210,7 +217,7 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
     }
 });
 
-// Obter saldo
+// ✅ CORRIGIDO: Obter saldo com taxa R$ 0,20 POR TRANSAÇÃO
 app.get('/api/balance', authenticateToken, async (req, res) => {
     try {
         console.log(`💰 Calculando saldo do usuário ${req.user.userId}`);
@@ -227,19 +234,32 @@ app.get('/api/balance', authenticateToken, async (req, res) => {
 
         const received = parseFloat(result.rows[0].received || 0);
         const sent = parseFloat(result.rows[0].sent || 0);
-        const balance = received - sent;
         const pendingTransactions = parseInt(result.rows[0].pending_count || 0);
+
+        // ✅ Calcular taxa PoloPag: R$ 0,20 FIXO por transação RECEBIDA
+        const transactionsResult = await pool.query(
+            `SELECT COUNT(*) as count FROM transactions
+             WHERE user_id = $1 AND type = 'received' AND status = 'completed'`,
+            [req.user.userId]
+        );
+
+        const TAXA_POLOPAG_POR_TRANSACAO = 0.20; // R$ 0,20 fixo
+        const quantidadeTransacoesRecebidas = parseInt(transactionsResult.rows[0].count || 0);
+        const totalTaxas = quantidadeTransacoesRecebidas * TAXA_POLOPAG_POR_TRANSACAO;
+
+        const balance = received - sent - totalTaxas;
 
         const balanceData = {
             balance: parseFloat(balance.toFixed(2)),
             totalReceived: parseFloat(received.toFixed(2)),
             totalSent: parseFloat(sent.toFixed(2)),
-            pendingTransactions: pendingTransactions
+            pendingTransactions: pendingTransactions,
+            taxaPoloPag: parseFloat(totalTaxas.toFixed(2))
         };
 
         console.log('✅ Saldo calculado:', balanceData);
+        console.log(`📊 ${quantidadeTransacoesRecebidas} transações recebidas × R$ 0,20 = R$ ${totalTaxas.toFixed(2)} em taxas`);
 
-        // ✅ CORRIGIDO: Retornar objeto direto (compatível com frontend)
         res.json(balanceData);
     } catch (error) {
         console.error('❌ Erro ao obter saldo:', error);
@@ -259,7 +279,6 @@ app.get('/api/pix-keys', authenticateToken, async (req, res) => {
 
         console.log(`✅ Encontradas ${result.rows.length} chaves PIX`);
 
-        // ✅ CORRIGIDO: Retornar array direto (compatível com frontend)
         res.json(result.rows);
     } catch (error) {
         console.error('❌ Erro ao listar chaves PIX:', error);
@@ -271,23 +290,10 @@ app.get('/api/pix-keys', authenticateToken, async (req, res) => {
 app.post('/api/pix-keys', authenticateToken, async (req, res) => {
     try {
         console.log('📥 Backend recebeu req.body:', req.body);
-        console.log('📥 Content-Type:', req.headers['content-type']);
 
-        // ✅ CORRIGIDO: Usar snake_case (key_type, key_value) ao invés de camelCase (keyType, keyValue)
         const { key_type, key_value, holder_name, holder_document, bank_name, status } = req.body;
 
-        console.log('📋 Dados extraídos:', {
-            key_type,
-            key_value,
-            holder_name,
-            holder_document,
-            bank_name,
-            status
-        });
-
-        // Validação
         if (!key_type || !key_value) {
-            console.error('❌ Validação falhou: campos ausentes');
             return res.status(400).json({
                 error: 'Campos obrigatórios ausentes',
                 details: {
@@ -310,16 +316,14 @@ app.post('/api/pix-keys', authenticateToken, async (req, res) => {
             ]
         );
 
-        console.log('✅ Chave PIX criada com sucesso:', result.rows[0]);
+        console.log('✅ Chave PIX criada:', result.rows[0]);
 
-        // ✅ CORRIGIDO: Retornar no formato esperado pelo frontend
         res.status(201).json({
             success: true,
             data: result.rows[0]
         });
     } catch (error) {
         console.error('❌ Erro ao adicionar chave PIX:', error);
-        console.error('Stack:', error.stack);
         res.status(500).json({ error: error.message });
     }
 });
@@ -329,16 +333,13 @@ app.delete('/api/pix-keys/:id', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
 
-        console.log(`🗑️ Deletando chave PIX ${id} do usuário ${req.user.userId}`);
-
-        // Verificar se a chave pertence ao usuário
         const checkResult = await pool.query(
             'SELECT * FROM pix_keys WHERE id = $1 AND user_id = $2',
             [id, req.user.userId]
         );
 
         if (checkResult.rows.length === 0) {
-            return res.status(404).json({ error: 'Chave não encontrada ou não pertence ao usuário' });
+            return res.status(404).json({ error: 'Chave não encontrada' });
         }
 
         await pool.query(
@@ -346,12 +347,98 @@ app.delete('/api/pix-keys/:id', authenticateToken, async (req, res) => {
             [id, req.user.userId]
         );
 
-        console.log(`✅ Chave PIX ${id} deletada com sucesso`);
+        console.log(`✅ Chave PIX ${id} deletada`);
 
-        res.json({ success: true, message: 'Chave PIX removida com sucesso' });
+        res.json({ success: true });
     } catch (error) {
         console.error('❌ Erro ao deletar chave PIX:', error);
         res.status(500).json({ error: error.message });
+    }
+});
+
+// ✅ NOVA FUNCIONALIDADE: Enviar PIX (SAQUE)
+app.post('/api/send-pix', authenticateToken, async (req, res) => {
+    try {
+        const { valor, chave_pix, tipo_chave, descricao } = req.body;
+
+        console.log('💸 Solicitação de saque PIX:', { valor, chave_pix, tipo_chave });
+
+        // Validações
+        if (!valor || valor <= 0) {
+            return res.status(400).json({ error: 'Valor inválido' });
+        }
+
+        if (!chave_pix || !tipo_chave) {
+            return res.status(400).json({ error: 'Chave PIX não fornecida' });
+        }
+
+        // Verificar saldo do usuário
+        const balanceResult = await pool.query(
+            `SELECT
+                SUM(CASE WHEN type = 'received' AND status = 'completed' THEN amount ELSE 0 END) as received,
+                SUM(CASE WHEN type = 'sent' AND status = 'completed' THEN amount ELSE 0 END) as sent
+            FROM transactions
+            WHERE user_id = $1`,
+            [req.user.userId]
+        );
+
+        const received = parseFloat(balanceResult.rows[0].received || 0);
+        const sent = parseFloat(balanceResult.rows[0].sent || 0);
+
+        // Calcular taxas sobre transações recebidas
+        const taxResult = await pool.query(
+            `SELECT COUNT(*) as count FROM transactions
+             WHERE user_id = $1 AND type = 'received' AND status = 'completed'`,
+            [req.user.userId]
+        );
+        const totalTaxas = parseInt(taxResult.rows[0].count || 0) * 0.20;
+        const saldoDisponivel = received - sent - totalTaxas;
+
+        console.log(`💰 Saldo disponível: R$ ${saldoDisponivel.toFixed(2)}`);
+
+        if (saldoDisponivel < parseFloat(valor)) {
+            return res.status(400).json({
+                error: 'Saldo insuficiente',
+                saldoDisponivel: parseFloat(saldoDisponivel.toFixed(2)),
+                valorSolicitado: parseFloat(valor)
+            });
+        }
+
+        // Registrar transação de saída como COMPLETED (já que é instantâneo)
+        const insertResult = await pool.query(
+            `INSERT INTO transactions
+            (user_id, type, amount, receiver_name, description, status)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING *`,
+            [
+                req.user.userId,
+                'sent',
+                parseFloat(valor),
+                chave_pix,
+                descricao || `Saque PIX para ${tipo_chave}: ${chave_pix}`,
+                'completed'  // Saque é imediato
+            ]
+        );
+
+        console.log('✅ Saque PIX registrado:', insertResult.rows[0]);
+
+        res.json({
+            success: true,
+            message: 'Saque realizado com sucesso!',
+            data: {
+                transactionId: insertResult.rows[0].id,
+                valor: parseFloat(valor),
+                chavePix: chave_pix,
+                novoSaldo: parseFloat((saldoDisponivel - parseFloat(valor)).toFixed(2))
+            }
+        });
+
+    } catch (error) {
+        console.error('❌ Erro ao realizar saque:', error);
+        res.status(500).json({
+            error: 'Erro ao realizar saque',
+            message: error.message
+        });
     }
 });
 
