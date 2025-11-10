@@ -23,11 +23,11 @@ app.get('/health', (req, res) => {
 app.post('/api/auth/register', async (req, res) => {
     try {
         const { email, password, fullName } = req.body;
-        
+
         if (!email || !password) {
             return res.status(400).json({ error: 'Email e senha são obrigatórios' });
         }
-        
+
         const user = await register(email, password, fullName);
         res.json({ success: true, user });
     } catch (error) {
@@ -101,15 +101,15 @@ app.post('/api/create-pix', authenticateToken, async (req, res) => {
     await pool.query(
         'INSERT INTO transactions (user_id, type, amount, payer_name, payer_document, receiver_name, transaction_id, qr_code, description, status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
         [
-            req.user.userId, 
-            'received', 
-            parseFloat(valor), 
+            req.user.userId,
+            'received',
+            parseFloat(valor),
             devedor?.nome || null,
             devedor?.cpf || null,
             pixData.solicitacaoPagador,
-            responseData.txid, 
-            responseData.pixCopiaECola, 
-            descricao, 
+            responseData.txid,
+            responseData.pixCopiaECola,
+            descricao,
             'pending'
         ]
     );
@@ -188,16 +188,24 @@ app.get('/api/check-pix/:txid', authenticateToken, async (req, res) => {
   }
 });
 
+// ==================== ROTAS CORRIGIDAS ====================
+
 // Listar transações do usuário
 app.get('/api/transactions', authenticateToken, async (req, res) => {
     try {
+        console.log(`📊 Buscando transações do usuário ${req.user.userId}`);
+
         const result = await pool.query(
             'SELECT * FROM transactions WHERE user_id = $1 ORDER BY created_at DESC',
             [req.user.userId]
         );
-        res.json({ success: true, transactions: result.rows });
+
+        console.log(`✅ Encontradas ${result.rows.length} transações`);
+
+        // ✅ CORRIGIDO: Retornar array direto (compatível com frontend)
+        res.json(result.rows);
     } catch (error) {
-        console.error('Erro ao listar transações:', error);
+        console.error('❌ Erro ao listar transações:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -205,10 +213,13 @@ app.get('/api/transactions', authenticateToken, async (req, res) => {
 // Obter saldo
 app.get('/api/balance', authenticateToken, async (req, res) => {
     try {
+        console.log(`💰 Calculando saldo do usuário ${req.user.userId}`);
+
         const result = await pool.query(
             `SELECT
                 SUM(CASE WHEN type = 'received' AND status = 'completed' THEN amount ELSE 0 END) as received,
-                SUM(CASE WHEN type = 'sent' AND status = 'completed' THEN amount ELSE 0 END) as sent
+                SUM(CASE WHEN type = 'sent' AND status = 'completed' THEN amount ELSE 0 END) as sent,
+                COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_count
             FROM transactions
             WHERE user_id = $1`,
             [req.user.userId]
@@ -217,10 +228,21 @@ app.get('/api/balance', authenticateToken, async (req, res) => {
         const received = parseFloat(result.rows[0].received || 0);
         const sent = parseFloat(result.rows[0].sent || 0);
         const balance = received - sent;
+        const pendingTransactions = parseInt(result.rows[0].pending_count || 0);
 
-        res.json({ success: true, balance, received, sent });
+        const balanceData = {
+            balance: parseFloat(balance.toFixed(2)),
+            totalReceived: parseFloat(received.toFixed(2)),
+            totalSent: parseFloat(sent.toFixed(2)),
+            pendingTransactions: pendingTransactions
+        };
+
+        console.log('✅ Saldo calculado:', balanceData);
+
+        // ✅ CORRIGIDO: Retornar objeto direto (compatível com frontend)
+        res.json(balanceData);
     } catch (error) {
-        console.error('Erro ao obter saldo:', error);
+        console.error('❌ Erro ao obter saldo:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -228,13 +250,19 @@ app.get('/api/balance', authenticateToken, async (req, res) => {
 // Listar chaves PIX do usuário
 app.get('/api/pix-keys', authenticateToken, async (req, res) => {
     try {
+        console.log(`🔑 Listando chaves PIX do usuário ${req.user.userId}`);
+
         const result = await pool.query(
             'SELECT * FROM pix_keys WHERE user_id = $1 ORDER BY created_at DESC',
             [req.user.userId]
         );
-        res.json({ success: true, pixKeys: result.rows });
+
+        console.log(`✅ Encontradas ${result.rows.length} chaves PIX`);
+
+        // ✅ CORRIGIDO: Retornar array direto (compatível com frontend)
+        res.json(result.rows);
     } catch (error) {
-        console.error('Erro ao listar chaves PIX:', error);
+        console.error('❌ Erro ao listar chaves PIX:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -242,16 +270,56 @@ app.get('/api/pix-keys', authenticateToken, async (req, res) => {
 // Adicionar chave PIX
 app.post('/api/pix-keys', authenticateToken, async (req, res) => {
     try {
-        const { keyType, keyValue, holderName, holderDocument, bankName } = req.body;
-        
+        console.log('📥 Backend recebeu req.body:', req.body);
+        console.log('📥 Content-Type:', req.headers['content-type']);
+
+        // ✅ CORRIGIDO: Usar snake_case (key_type, key_value) ao invés de camelCase (keyType, keyValue)
+        const { key_type, key_value, holder_name, holder_document, bank_name, status } = req.body;
+
+        console.log('📋 Dados extraídos:', {
+            key_type,
+            key_value,
+            holder_name,
+            holder_document,
+            bank_name,
+            status
+        });
+
+        // Validação
+        if (!key_type || !key_value) {
+            console.error('❌ Validação falhou: campos ausentes');
+            return res.status(400).json({
+                error: 'Campos obrigatórios ausentes',
+                details: {
+                    key_type: key_type ? 'ok' : 'ausente',
+                    key_value: key_value ? 'ok' : 'ausente'
+                }
+            });
+        }
+
         const result = await pool.query(
-            'INSERT INTO pix_keys (user_id, key_type, key_value, holder_name, holder_document, bank_name) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-            [req.user.userId, keyType, keyValue, holderName, holderDocument, bankName]
+            'INSERT INTO pix_keys (user_id, key_type, key_value, holder_name, holder_document, bank_name, status) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *',
+            [
+                req.user.userId,
+                key_type,
+                key_value,
+                holder_name || 'Usuario',
+                holder_document || '00000000000',
+                bank_name || 'PoloPag',
+                status || 'active'
+            ]
         );
-        
-        res.json({ success: true, pixKey: result.rows[0] });
+
+        console.log('✅ Chave PIX criada com sucesso:', result.rows[0]);
+
+        // ✅ CORRIGIDO: Retornar no formato esperado pelo frontend
+        res.status(201).json({
+            success: true,
+            data: result.rows[0]
+        });
     } catch (error) {
-        console.error('Erro ao adicionar chave PIX:', error);
+        console.error('❌ Erro ao adicionar chave PIX:', error);
+        console.error('Stack:', error.stack);
         res.status(500).json({ error: error.message });
     }
 });
@@ -260,13 +328,29 @@ app.post('/api/pix-keys', authenticateToken, async (req, res) => {
 app.delete('/api/pix-keys/:id', authenticateToken, async (req, res) => {
     try {
         const { id } = req.params;
+
+        console.log(`🗑️ Deletando chave PIX ${id} do usuário ${req.user.userId}`);
+
+        // Verificar se a chave pertence ao usuário
+        const checkResult = await pool.query(
+            'SELECT * FROM pix_keys WHERE id = $1 AND user_id = $2',
+            [id, req.user.userId]
+        );
+
+        if (checkResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Chave não encontrada ou não pertence ao usuário' });
+        }
+
         await pool.query(
             'DELETE FROM pix_keys WHERE id = $1 AND user_id = $2',
             [id, req.user.userId]
         );
-        res.json({ success: true });
+
+        console.log(`✅ Chave PIX ${id} deletada com sucesso`);
+
+        res.json({ success: true, message: 'Chave PIX removida com sucesso' });
     } catch (error) {
-        console.error('Erro ao deletar chave PIX:', error);
+        console.error('❌ Erro ao deletar chave PIX:', error);
         res.status(500).json({ error: error.message });
     }
 });
